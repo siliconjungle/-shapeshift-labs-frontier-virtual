@@ -1,0 +1,59 @@
+{
+  "name": "@shapeshift-labs/frontier-virtual",
+  "version": "0.1.0",
+  "description": "DOM-neutral virtualization and materialization primitives for Frontier renderers.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/siliconjungle/-shapeshift-labs-frontier-virtual.git"
+  },
+  "homepage": "https://github.com/siliconjungle/-shapeshift-labs-frontier-virtual#readme",
+  "bugs": {
+    "url": "https://github.com/siliconjungle/-shapeshift-labs-frontier-virtual/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "benchmarks/package-bench.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "npm run build && npm run typecheck && node test/smoke.mjs && node test/fuzz.mjs --cases 300",
+    "prepack": "npm run readme:packages:check && npm run test",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
+    "fuzz": "npm run build && node test/fuzz.mjs",
+    "bench": "npm run build && node --expose-gc benchmarks/package-bench.mjs --out benchmarks/results/frontier-virtual-package-bench-latest.json",
+    "pack:dry": "npm pack --dry-run",
+    "readme:packages": "node benchmarks/package-readme-sections.mjs",
+    "readme:packages:check": "node benchmarks/package-readme-sections.mjs --check"
+  },
+  "keywords": [
+    "frontier",
+    "virtualization",
+    "range",
+    "layout",
+    "frustum"
+  ],
+  "dependencies": {
+    "@shapeshift-labs/frontier": "0.1.8"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
