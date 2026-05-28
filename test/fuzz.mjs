@@ -1,5 +1,12 @@
 import assert from 'node:assert';
-import { createFixedLayout, createVariableLayout, virtualize } from '../dist/index.js';
+import {
+  captureVirtualAnchor,
+  createFixedLayout,
+  createVariableLayout,
+  resolveVirtualAnchorOffset,
+  virtualize,
+  virtualizeAnchored
+} from '../dist/index.js';
 
 const args = parseArgs(process.argv.slice(2));
 const cases = readPositiveInt(args.cases, 200);
@@ -40,7 +47,83 @@ function runCase(caseId, rng) {
       assert.ok(item.size >= 0);
       previousOffset = item.offset;
     }
+    assertAnchorPreservation(rng, rows, sizes);
   }
+}
+
+function assertAnchorPreservation(rng, rows, sizes) {
+  const layout = createVariableLayout({ defaultSize: 10, sizes });
+  const viewport = { offset: randomInt(rng, rows.length * 30), size: 1 + randomInt(rng, 300) };
+  const range = virtualize({
+    items: rows,
+    keyBy: 'id',
+    viewport,
+    layout,
+    overscan: randomInt(rng, 4),
+    overscanPx: randomInt(rng, 20)
+  });
+  const anchor = captureVirtualAnchor(range, { policy: randomAnchorPolicy(rng) });
+  if (!anchor) return;
+
+  const nextSizes = { ...sizes };
+  const mutations = 1 + randomInt(rng, Math.min(5, rows.length));
+  for (let mutation = 0; mutation < mutations; mutation++) {
+    const row = rows[randomInt(rng, rows.length)];
+    nextSizes[row.id] = 1 + randomInt(rng, 50);
+  }
+  const nextLayout = createVariableLayout({ defaultSize: 10, sizes: nextSizes });
+  const expected = expectedAnchorOffset(rows, nextSizes, range.viewport, anchor, 10);
+  const offset = resolveVirtualAnchorOffset({
+    items: rows,
+    keyBy: 'id',
+    viewport: range.viewport,
+    layout: nextLayout,
+    anchor
+  });
+  assert.strictEqual(offset, expected.offset);
+  const anchored = virtualizeAnchored({
+    items: rows,
+    keyBy: 'id',
+    viewport: range.viewport,
+    layout: nextLayout,
+    anchor
+  });
+  assert.strictEqual(anchored.viewport.offset, expected.offset);
+  if (!expected.clamped && !expected.itemOffsetClamped && !expected.itemOffsetAtEnd) {
+    const anchoredItem = anchored.items.find((item) => item.key === anchor.key);
+    assert.ok(anchoredItem);
+    assert.strictEqual(anchoredItem.offset + expected.itemOffset - anchored.viewport.offset, anchor.viewportOffset);
+  }
+}
+
+function expectedAnchorOffset(rows, sizes, viewport, anchor, defaultSize) {
+  let totalSize = 0;
+  let foundOffset = null;
+  let foundSize = 0;
+  for (const row of rows) {
+    const size = sizes[row.id] ?? defaultSize;
+    if (foundOffset === null && row.id === anchor.key) {
+      foundOffset = totalSize;
+      foundSize = size;
+    }
+    totalSize += size;
+  }
+  const itemOffset = Math.max(0, Math.min(foundSize, anchor.itemOffset));
+  const raw = foundOffset === null ? viewport.offset : foundOffset + itemOffset - anchor.viewportOffset;
+  const maxOffset = Math.max(0, totalSize - viewport.size);
+  const offset = Math.max(0, Math.min(maxOffset, raw));
+  return {
+    offset,
+    clamped: offset !== raw,
+    itemOffset,
+    itemOffsetClamped: itemOffset !== anchor.itemOffset,
+    itemOffsetAtEnd: foundSize > 0 && itemOffset >= foundSize
+  };
+}
+
+function randomAnchorPolicy(rng) {
+  const policies = ['start', 'center', 'end', 'preserve'];
+  return policies[randomInt(rng, policies.length)];
 }
 
 function parseArgs(argv) {

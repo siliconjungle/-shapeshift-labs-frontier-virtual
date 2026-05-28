@@ -83,6 +83,25 @@ export interface FrontierVirtualResult {
   items: FrontierVirtualItem[];
 }
 
+export interface FrontierVirtualAnchor {
+  kind: 'frontier.virtual.anchor';
+  version: 1;
+  key: string;
+  index: number;
+  itemOffset: number;
+  itemSize: number;
+  viewportOffset: number;
+  policy: FrontierVirtualAnchorPolicy;
+}
+
+export interface FrontierVirtualAnchorOptions {
+  policy?: FrontierVirtualAnchorPolicy;
+}
+
+export interface FrontierVirtualAnchorResolveOptions extends FrontierVirtualizeOptions {
+  anchor?: FrontierVirtualAnchor | null;
+}
+
 export interface FrontierVirtualWindowSource {
   readWindow(start: number, end: number): JsonValue[] | Promise<JsonValue[]>;
   count?(): number | Promise<number>;
@@ -402,6 +421,82 @@ export function virtualize(options: FrontierVirtualizeOptions): FrontierVirtualR
   };
 }
 
+export function captureVirtualAnchor(
+  range: FrontierVirtualResult,
+  options: FrontierVirtualAnchorOptions = {}
+): FrontierVirtualAnchor | null {
+  if (range.items.length === 0) return null;
+  const viewport = normalizeViewport(range.viewport);
+  const policy = options.policy ?? range.anchorPolicy ?? 'start';
+  const viewportOffset = anchorViewportOffset(policy, viewport.size);
+  const targetOffset = viewport.offset + viewportOffset;
+  const preferBeforeTarget = policy === 'end';
+  let item = range.items[0];
+  if (preferBeforeTarget) {
+    for (let index = range.items.length - 1; index >= 0; index--) {
+      const candidate = range.items[index];
+      if (candidate.offset < targetOffset || index === 0) {
+        item = candidate;
+        break;
+      }
+    }
+  } else {
+    for (let index = 0; index < range.items.length; index++) {
+      const candidate = range.items[index];
+      if (candidate.offset + candidate.size > targetOffset || index === range.items.length - 1) {
+        item = candidate;
+        break;
+      }
+    }
+  }
+  return {
+    kind: 'frontier.virtual.anchor',
+    version: 1,
+    key: item.key,
+    index: item.index,
+    itemOffset: clampNumber(targetOffset - item.offset, 0, item.size),
+    itemSize: item.size,
+    viewportOffset,
+    policy
+  };
+}
+
+export function resolveVirtualAnchorOffset(options: FrontierVirtualAnchorResolveOptions): number {
+  const viewport = normalizeViewport(options.viewport);
+  const anchor = options.anchor;
+  if (!isVirtualAnchor(anchor)) {
+    const totalSize = measureVirtualTotalSize(options, viewport);
+    return clampVirtualOffset(viewport.offset, totalSize, viewport.size);
+  }
+  const resolved = resolveVirtualAnchorPosition(options, viewport, anchor);
+  if (resolved.offset === null) return clampVirtualOffset(viewport.offset, resolved.totalSize, viewport.size);
+  return resolveVirtualAnchorOffsetFromPosition(anchor, resolved.offset, resolved.size, resolved.totalSize, viewport);
+}
+
+export function virtualizeAnchored(options: FrontierVirtualAnchorResolveOptions): FrontierVirtualResult {
+  const viewport = normalizeViewport(options.viewport);
+  const anchor = options.anchor;
+  if (isVirtualAnchor(anchor)) {
+    const collection = options.items !== undefined
+      ? options.items
+      : options.path === undefined
+        ? options.source
+        : readPath(options.source, normalizePath(options.path));
+    if (readFixedSize(options.layout) === null) {
+      const keyBy = options.keyBy ?? 'id';
+      if (Array.isArray(collection)) return virtualizeMeasuredArrayAnchored(collection, options, viewport, anchor, keyBy);
+      return virtualizeMeasuredEntriesAnchored(enumerateVirtualCollection(collection, keyBy), options, viewport, anchor);
+    }
+  }
+  const offset = resolveVirtualAnchorOffset(options);
+  const { anchor: _anchor, ...virtualOptions } = options;
+  return virtualize({
+    ...virtualOptions,
+    viewport: { ...viewport, offset },
+    anchorPolicy: options.anchor?.policy ?? options.anchorPolicy ?? 'preserve'
+  });
+}
+
 export function scheduleVirtualize(
   options: FrontierVirtualizeOptions,
   schedule: FrontierVirtualScheduleOptions<FrontierVirtualResult>
@@ -512,6 +607,233 @@ function virtualizeFixedArray(
   };
 }
 
+function virtualizeFixedIndexItems(
+  count: number,
+  viewportInput: FrontierVirtualViewport,
+  itemSize: number,
+  overscanInput: number
+): FrontierVirtualResult {
+  const viewport = normalizeViewport(viewportInput);
+  const totalItems = Math.max(0, Math.floor(count));
+  const totalSize = totalItems * itemSize;
+  const overscan = Math.max(0, Math.floor(overscanInput));
+  const windowStart = viewport.offset;
+  const windowEnd = Math.min(totalSize, viewport.offset + viewport.size);
+  let startIndex = itemSize > 0 ? Math.floor(windowStart / itemSize) : 0;
+  let endIndex = itemSize > 0 ? Math.ceil(windowEnd / itemSize) : 0;
+  startIndex = Math.min(totalItems, startIndex);
+  endIndex = Math.min(totalItems, endIndex);
+  startIndex = Math.max(0, startIndex - overscan);
+  endIndex = Math.min(totalItems, Math.max(startIndex, endIndex + overscan));
+  const items = new Array<FrontierVirtualItem>(Math.max(0, endIndex - startIndex));
+  for (let index = startIndex; index < endIndex; index++) {
+    const key = String(index);
+    items[index - startIndex] = {
+      key,
+      index,
+      value: { id: key },
+      offset: index * itemSize,
+      size: itemSize
+    };
+  }
+  return {
+    kind: 'frontier.virtual.result',
+    totalItems,
+    totalSize,
+    startIndex,
+    endIndex,
+    offsetBefore: startIndex * itemSize,
+    offsetAfter: totalSize - endIndex * itemSize,
+    viewport,
+    overscan,
+    overscanPx: 0,
+    anchorPolicy: 'start',
+    items
+  };
+}
+
+function virtualizeMeasuredArrayAnchored(
+  collection: JsonValue[],
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  anchor: FrontierVirtualAnchor,
+  keyBy: string | number | FrontierVirtualKeyGetter
+): FrontierVirtualResult {
+  const totalItems = collection.length;
+  const sizes = new Array<number>(totalItems);
+  const offsets = new Array<number>(totalItems + 1);
+  const layout = options.layout;
+  const fallbackSize = layout.defaultSize ?? 0;
+  const crossSize = viewport.crossSize;
+  let foundOffset: number | null = null;
+  let foundSize = 0;
+  offsets[0] = 0;
+  for (let index = 0; index < totalItems; index++) {
+    const value = collection[index];
+    const key = readItemKey(value, index, index, keyBy);
+    const size = sanitizeSize(layout.getSize({ key, index, value, viewport, crossSize }), fallbackSize);
+    sizes[index] = size;
+    if (foundOffset === null && key === anchor.key) {
+      foundOffset = offsets[index];
+      foundSize = size;
+    }
+    offsets[index + 1] = offsets[index] + size;
+  }
+  const totalSize = offsets[totalItems] ?? 0;
+  const anchoredOffset = foundOffset === null
+    ? clampVirtualOffset(viewport.offset, totalSize, viewport.size)
+    : resolveVirtualAnchorOffsetFromPosition(anchor, foundOffset, foundSize, totalSize, viewport);
+  return materializeMeasuredArrayResult(
+    collection,
+    keyBy,
+    sizes,
+    offsets,
+    totalSize,
+    options,
+    { ...viewport, offset: anchoredOffset },
+    anchor.policy
+  );
+}
+
+function virtualizeMeasuredEntriesAnchored(
+  entries: Array<{ key: string; value: JsonValue | undefined }>,
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  anchor: FrontierVirtualAnchor
+): FrontierVirtualResult {
+  const totalItems = entries.length;
+  const sizes = new Array<number>(totalItems);
+  const offsets = new Array<number>(totalItems + 1);
+  const layout = options.layout;
+  const fallbackSize = layout.defaultSize ?? 0;
+  const crossSize = viewport.crossSize;
+  let foundOffset: number | null = null;
+  let foundSize = 0;
+  offsets[0] = 0;
+  for (let index = 0; index < totalItems; index++) {
+    const entry = entries[index];
+    const size = sanitizeSize(layout.getSize({
+      key: entry.key,
+      index,
+      value: entry.value,
+      viewport,
+      crossSize
+    }), fallbackSize);
+    sizes[index] = size;
+    if (foundOffset === null && entry.key === anchor.key) {
+      foundOffset = offsets[index];
+      foundSize = size;
+    }
+    offsets[index + 1] = offsets[index] + size;
+  }
+  const totalSize = offsets[totalItems] ?? 0;
+  const anchoredOffset = foundOffset === null
+    ? clampVirtualOffset(viewport.offset, totalSize, viewport.size)
+    : resolveVirtualAnchorOffsetFromPosition(anchor, foundOffset, foundSize, totalSize, viewport);
+  return materializeMeasuredEntriesResult(
+    entries,
+    sizes,
+    offsets,
+    totalSize,
+    options,
+    { ...viewport, offset: anchoredOffset },
+    anchor.policy
+  );
+}
+
+function materializeMeasuredArrayResult(
+  collection: JsonValue[],
+  keyBy: string | number | FrontierVirtualKeyGetter,
+  sizes: number[],
+  offsets: number[],
+  totalSize: number,
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  anchorPolicy: FrontierVirtualAnchorPolicy
+): FrontierVirtualResult {
+  const totalItems = collection.length;
+  const overscan = Math.max(0, Math.floor(options.overscan ?? 0));
+  const overscanPx = Math.max(0, options.overscanPx ?? 0);
+  const windowStart = Math.max(0, viewport.offset - overscanPx);
+  const windowEnd = Math.min(totalSize, viewport.offset + viewport.size + overscanPx);
+  let startIndex = lowerBoundOffset(offsets, windowStart);
+  let endIndex = lowerBoundOffset(offsets, windowEnd);
+  if (endIndex < totalItems && offsets[endIndex] < windowEnd) endIndex++;
+  startIndex = Math.max(0, startIndex - overscan);
+  endIndex = Math.min(totalItems, Math.max(startIndex, endIndex + overscan));
+  const items = new Array<FrontierVirtualItem>(Math.max(0, endIndex - startIndex));
+  for (let index = startIndex; index < endIndex; index++) {
+    const value = collection[index];
+    items[index - startIndex] = {
+      key: readItemKey(value, index, index, keyBy),
+      index,
+      value,
+      offset: offsets[index],
+      size: sizes[index]
+    };
+  }
+  return {
+    kind: 'frontier.virtual.result',
+    totalItems,
+    totalSize,
+    startIndex,
+    endIndex,
+    offsetBefore: offsets[startIndex] ?? 0,
+    offsetAfter: totalSize - (offsets[endIndex] ?? totalSize),
+    viewport,
+    overscan,
+    overscanPx,
+    anchorPolicy,
+    items
+  };
+}
+
+function materializeMeasuredEntriesResult(
+  entries: Array<{ key: string; value: JsonValue | undefined }>,
+  sizes: number[],
+  offsets: number[],
+  totalSize: number,
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  anchorPolicy: FrontierVirtualAnchorPolicy
+): FrontierVirtualResult {
+  const totalItems = entries.length;
+  const overscan = Math.max(0, Math.floor(options.overscan ?? 0));
+  const overscanPx = Math.max(0, options.overscanPx ?? 0);
+  const windowStart = Math.max(0, viewport.offset - overscanPx);
+  const windowEnd = Math.min(totalSize, viewport.offset + viewport.size + overscanPx);
+  let startIndex = lowerBoundOffset(offsets, windowStart);
+  let endIndex = lowerBoundOffset(offsets, windowEnd);
+  if (endIndex < totalItems && offsets[endIndex] < windowEnd) endIndex++;
+  startIndex = Math.max(0, startIndex - overscan);
+  endIndex = Math.min(totalItems, Math.max(startIndex, endIndex + overscan));
+  const items = new Array<FrontierVirtualItem>(Math.max(0, endIndex - startIndex));
+  for (let index = startIndex; index < endIndex; index++) {
+    const entry = entries[index];
+    items[index - startIndex] = {
+      key: entry.key,
+      index,
+      value: entry.value,
+      offset: offsets[index],
+      size: sizes[index]
+    };
+  }
+  return {
+    kind: 'frontier.virtual.result',
+    totalItems,
+    totalSize,
+    startIndex,
+    endIndex,
+    offsetBefore: offsets[startIndex] ?? 0,
+    offsetAfter: totalSize - (offsets[endIndex] ?? totalSize),
+    viewport,
+    overscan,
+    overscanPx,
+    anchorPolicy,
+    items
+  };
+}
+
 export function materializeRange<T>(
   range: FrontierVirtualResult,
   callback: (item: FrontierVirtualItem, localIndex: number) => T
@@ -562,33 +884,46 @@ export function deserializeLayoutState(state: FrontierVirtualSerializedLayoutSta
 }
 
 export function virtualizeGrid(options: FrontierVirtualGridOptions): FrontierVirtualGridResult {
-  const rows = virtualize({
-    items: makeIndexItems(options.rowCount),
-    keyBy: 'id',
-    viewport: { offset: options.viewport.offset, size: options.viewport.size },
-    layout: options.rowLayout,
-    overscan: options.overscanRows ?? 0
-  });
-  const columns = virtualize({
-    items: makeIndexItems(options.columnCount),
-    keyBy: 'id',
-    viewport: {
-      offset: options.viewport.crossOffset ?? 0,
-      size: options.viewport.crossSize ?? 0
-    },
-    layout: options.columnLayout,
-    overscan: options.overscanColumns ?? 0
-  });
-  const cells: FrontierVirtualGridCell[] = [];
-  for (let row = 0; row < rows.items.length; row++) {
-    for (let column = 0; column < columns.items.length; column++) {
-      cells[cells.length] = {
-        rowIndex: rows.items[row].index,
-        columnIndex: columns.items[column].index,
-        rowOffset: rows.items[row].offset,
-        columnOffset: columns.items[column].offset,
-        rowSize: rows.items[row].size,
-        columnSize: columns.items[column].size
+  const rowViewport = { offset: options.viewport.offset, size: options.viewport.size };
+  const columnViewport = {
+    offset: options.viewport.crossOffset ?? 0,
+    size: options.viewport.crossSize ?? 0
+  };
+  const rowFixedSize = readFixedSize(options.rowLayout);
+  const columnFixedSize = readFixedSize(options.columnLayout);
+  const rows = rowFixedSize === null
+    ? virtualize({
+        items: makeIndexItems(options.rowCount),
+        keyBy: 'id',
+        viewport: rowViewport,
+        layout: options.rowLayout,
+        overscan: options.overscanRows ?? 0
+      })
+    : virtualizeFixedIndexItems(options.rowCount, rowViewport, rowFixedSize, options.overscanRows ?? 0);
+  const columns = columnFixedSize === null
+    ? virtualize({
+        items: makeIndexItems(options.columnCount),
+        keyBy: 'id',
+        viewport: columnViewport,
+        layout: options.columnLayout,
+        overscan: options.overscanColumns ?? 0
+      })
+    : virtualizeFixedIndexItems(options.columnCount, columnViewport, columnFixedSize, options.overscanColumns ?? 0);
+  const rowItems = rows.items;
+  const columnItems = columns.items;
+  const cells = new Array<FrontierVirtualGridCell>(rowItems.length * columnItems.length);
+  let cellIndex = 0;
+  for (let row = 0; row < rowItems.length; row++) {
+    const rowItem = rowItems[row];
+    for (let column = 0; column < columnItems.length; column++) {
+      const columnItem = columnItems[column];
+      cells[cellIndex++] = {
+        rowIndex: rowItem.index,
+        columnIndex: columnItem.index,
+        rowOffset: rowItem.offset,
+        columnOffset: columnItem.offset,
+        rowSize: rowItem.size,
+        columnSize: columnItem.size
       };
     }
   }
@@ -632,11 +967,27 @@ export function virtualizeFrustum(
   items: FrontierVirtualAabb3Item[],
   frustum: FrontierVirtualFrustum
 ): FrontierVirtualAabb3Item[] {
-  const out: FrontierVirtualAabb3Item[] = [];
+  const out = new Array<FrontierVirtualAabb3Item>(items.length);
+  const planes = frustum.planes;
+  const planeCount = planes.length;
   const overscan = frustum.overscan ?? 0;
+  let outLength = 0;
   for (let i = 0; i < items.length; i++) {
-    if (aabbIntersectsFrustum(items[i], frustum.planes, overscan)) out[out.length] = items[i];
+    const box = items[i];
+    let visible = true;
+    for (let planeIndex = 0; planeIndex < planeCount; planeIndex++) {
+      const plane = planes[planeIndex];
+      const x = plane.x >= 0 ? box.maxX + overscan : box.minX - overscan;
+      const y = plane.y >= 0 ? box.maxY + overscan : box.minY - overscan;
+      const z = plane.z >= 0 ? box.maxZ + overscan : box.minZ - overscan;
+      if (plane.x * x + plane.y * y + plane.z * z + plane.w < 0) {
+        visible = false;
+        break;
+      }
+    }
+    if (visible) out[outLength++] = box;
   }
+  out.length = outLength;
   return out;
 }
 
@@ -708,6 +1059,148 @@ function appendTreeRows<T>(
   for (let i = 0; i < node.children.length; i++) appendTreeRows(node.children[i], depth + 1, node.key, expanded, rows);
 }
 
+function resolveVirtualAnchorPosition(
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  anchor: FrontierVirtualAnchor
+): { offset: number | null; size: number; totalSize: number } {
+  const collection = options.items !== undefined
+    ? options.items
+    : options.path === undefined
+      ? options.source
+      : readPath(options.source, normalizePath(options.path));
+  const keyBy = options.keyBy ?? 'id';
+  const fixedSize = readFixedSize(options.layout);
+  if (fixedSize !== null && Array.isArray(collection)) {
+    const totalSize = collection.length * fixedSize;
+    if (anchor.index >= 0 && anchor.index < collection.length) {
+      const value = collection[anchor.index];
+      if (readItemKey(value, anchor.index, anchor.index, keyBy) === anchor.key) {
+        return { offset: anchor.index * fixedSize, size: fixedSize, totalSize };
+      }
+    }
+    for (let index = 0; index < collection.length; index++) {
+      const value = collection[index];
+      if (readItemKey(value, index, index, keyBy) === anchor.key) {
+        return { offset: index * fixedSize, size: fixedSize, totalSize };
+      }
+    }
+    return { offset: null, size: 0, totalSize };
+  }
+  if (Array.isArray(collection)) {
+    return resolveVirtualAnchorArrayPosition(collection, options, viewport, anchor, keyBy);
+  }
+  return resolveVirtualAnchorEntryPosition(enumerateVirtualCollection(collection, keyBy), options, viewport, anchor);
+}
+
+function resolveVirtualAnchorArrayPosition(
+  collection: JsonValue[],
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  anchor: FrontierVirtualAnchor,
+  keyBy: string | number | FrontierVirtualKeyGetter
+): { offset: number | null; size: number; totalSize: number } {
+  const layout = options.layout;
+  const fallbackSize = layout.defaultSize ?? 0;
+  const crossSize = viewport.crossSize;
+  let totalSize = 0;
+  let foundOffset: number | null = null;
+  let foundSize = 0;
+  for (let index = 0; index < collection.length; index++) {
+    const value = collection[index];
+    const key = readItemKey(value, index, index, keyBy);
+    const size = sanitizeSize(layout.getSize({ key, index, value, viewport, crossSize }), fallbackSize);
+    if (foundOffset === null && key === anchor.key) {
+      foundOffset = totalSize;
+      foundSize = size;
+    }
+    totalSize += size;
+  }
+  return { offset: foundOffset, size: foundSize, totalSize };
+}
+
+function resolveVirtualAnchorEntryPosition(
+  entries: Array<{ key: string; value: JsonValue | undefined }>,
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  anchor: FrontierVirtualAnchor
+): { offset: number | null; size: number; totalSize: number } {
+  const layout = options.layout;
+  const fallbackSize = layout.defaultSize ?? 0;
+  const crossSize = viewport.crossSize;
+  let totalSize = 0;
+  let foundOffset: number | null = null;
+  let foundSize = 0;
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    const size = sanitizeSize(layout.getSize({
+      key: entry.key,
+      index,
+      value: entry.value,
+      viewport,
+      crossSize
+    }), fallbackSize);
+    if (foundOffset === null && entry.key === anchor.key) {
+      foundOffset = totalSize;
+      foundSize = size;
+    }
+    totalSize += size;
+  }
+  return { offset: foundOffset, size: foundSize, totalSize };
+}
+
+function measureVirtualTotalSize(options: FrontierVirtualizeOptions, viewport: FrontierVirtualViewport): number {
+  const collection = options.items !== undefined
+    ? options.items
+    : options.path === undefined
+      ? options.source
+      : readPath(options.source, normalizePath(options.path));
+  const fixedSize = readFixedSize(options.layout);
+  if (fixedSize !== null && Array.isArray(collection)) return collection.length * fixedSize;
+  if (Array.isArray(collection)) return measureVirtualArrayTotalSize(collection, options, viewport, options.keyBy ?? 'id');
+  return measureVirtualEntryTotalSize(enumerateVirtualCollection(collection, options.keyBy ?? 'id'), options, viewport);
+}
+
+function measureVirtualArrayTotalSize(
+  collection: JsonValue[],
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport,
+  keyBy: string | number | FrontierVirtualKeyGetter
+): number {
+  const layout = options.layout;
+  const fallbackSize = layout.defaultSize ?? 0;
+  const crossSize = viewport.crossSize;
+  let totalSize = 0;
+  for (let index = 0; index < collection.length; index++) {
+    const value = collection[index];
+    const key = readItemKey(value, index, index, keyBy);
+    totalSize += sanitizeSize(layout.getSize({ key, index, value, viewport, crossSize }), fallbackSize);
+  }
+  return totalSize;
+}
+
+function measureVirtualEntryTotalSize(
+  entries: Array<{ key: string; value: JsonValue | undefined }>,
+  options: FrontierVirtualizeOptions,
+  viewport: FrontierVirtualViewport
+): number {
+  const layout = options.layout;
+  const fallbackSize = layout.defaultSize ?? 0;
+  const crossSize = viewport.crossSize;
+  let totalSize = 0;
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    totalSize += sanitizeSize(layout.getSize({
+      key: entry.key,
+      index,
+      value: entry.value,
+      viewport,
+      crossSize
+    }), fallbackSize);
+  }
+  return totalSize;
+}
+
 function enumerateVirtualCollection(
   collection: JsonValue | undefined,
   keyBy: string | number | FrontierVirtualKeyGetter
@@ -758,6 +1251,47 @@ function normalizeViewport(viewport: FrontierVirtualViewport): FrontierVirtualVi
   };
 }
 
+function anchorViewportOffset(policy: FrontierVirtualAnchorPolicy, viewportSize: number): number {
+  if (policy === 'center') return viewportSize / 2;
+  if (policy === 'end') return viewportSize;
+  return 0;
+}
+
+function clampVirtualOffset(offset: number, totalSize: number, viewportSize: number): number {
+  const maxOffset = Math.max(0, totalSize - viewportSize);
+  const value = Number.isFinite(offset) ? offset : 0;
+  return clampNumber(value, 0, maxOffset);
+}
+
+function resolveVirtualAnchorOffsetFromPosition(
+  anchor: FrontierVirtualAnchor,
+  itemOffset: number,
+  itemSize: number,
+  totalSize: number,
+  viewport: FrontierVirtualViewport
+): number {
+  return clampVirtualOffset(
+    itemOffset + clampNumber(anchor.itemOffset, 0, itemSize) - anchor.viewportOffset,
+    totalSize,
+    viewport.size
+  );
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
+function isVirtualAnchor(value: FrontierVirtualAnchor | null | undefined): value is FrontierVirtualAnchor {
+  return value !== null &&
+    value !== undefined &&
+    value.kind === 'frontier.virtual.anchor' &&
+    value.version === 1 &&
+    typeof value.key === 'string';
+}
+
 function lowerBoundOffset(offsets: number[], target: number): number {
   let low = 0;
   let high = Math.max(0, offsets.length - 1);
@@ -802,21 +1336,6 @@ function readTextLayoutValue(
     return (value as Record<string | number, JsonValue>)[fieldKey];
   }
   return readPath(value, fieldPath);
-}
-
-function aabbIntersectsFrustum(
-  box: FrontierVirtualAabb3Item,
-  planes: FrontierVirtualFrustumPlane[],
-  overscan: number
-): boolean {
-  for (let i = 0; i < planes.length; i++) {
-    const plane = planes[i];
-    const x = plane.x >= 0 ? box.maxX + overscan : box.minX - overscan;
-    const y = plane.y >= 0 ? box.maxY + overscan : box.minY - overscan;
-    const z = plane.z >= 0 ? box.maxZ + overscan : box.minZ - overscan;
-    if (plane.x * x + plane.y * y + plane.z * z + plane.w < 0) return false;
-  }
-  return true;
 }
 
 function readSizeEntries(

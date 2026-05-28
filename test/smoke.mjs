@@ -1,10 +1,12 @@
 import assert from 'node:assert';
 import {
+  captureVirtualAnchor,
   createFixedLayout,
   createTextLayout,
   createVariableLayout,
   flattenVirtualTree,
   materializeWindowSource,
+  resolveVirtualAnchorOffset,
   scheduleMaterializeWindowSource,
   scheduleVirtualize,
   scheduleVirtualizeFrustum,
@@ -12,6 +14,7 @@ import {
   scheduleVirtualizeSpatial,
   serializeLayoutState,
   virtualize,
+  virtualizeAnchored,
   virtualizeFrustum,
   virtualizeGrid,
   virtualizeSpatial
@@ -36,8 +39,59 @@ assert.strictEqual(serializeLayoutState(fixed).provider, 'fixed');
 const variable = createVariableLayout({ defaultSize: 10, sizes: { r0: 40 } });
 assert.strictEqual(variable.getSize({ key: 'r0', index: 0, value: rows[0], viewport: { offset: 0, size: 10 } }), 40);
 
+{
+  const anchorLayout = createVariableLayout({ defaultSize: 10 });
+  const initial = virtualize({
+    items: rows,
+    keyBy: 'id',
+    viewport: { offset: 25, size: 40 },
+    layout: anchorLayout
+  });
+  const anchor = captureVirtualAnchor(initial, { policy: 'start' });
+  assert.ok(anchor);
+  assert.strictEqual(anchor.key, 'r2');
+  anchorLayout.setSize('r0', 30);
+  anchorLayout.setSize('r1', 15);
+  const offset = resolveVirtualAnchorOffset({
+    items: rows,
+    keyBy: 'id',
+    viewport: initial.viewport,
+    layout: anchorLayout,
+    anchor
+  });
+  assert.strictEqual(offset, 50);
+  const restoredAnchor = JSON.parse(JSON.stringify(anchor));
+  assert.strictEqual(resolveVirtualAnchorOffset({
+    items: rows,
+    keyBy: 'id',
+    viewport: initial.viewport,
+    layout: anchorLayout,
+    anchor: restoredAnchor
+  }), offset);
+  const anchored = virtualizeAnchored({
+    items: rows,
+    keyBy: 'id',
+    viewport: initial.viewport,
+    layout: anchorLayout,
+    anchor
+  });
+  const anchoredItem = anchored.items.find((item) => item.key === anchor.key);
+  assert.ok(anchoredItem);
+  assert.strictEqual(anchoredItem.offset + anchor.itemOffset - anchored.viewport.offset, anchor.viewportOffset);
+}
+
 const text = createTextLayout({ field: 'body', font: '14px Inter', lineHeight: 20, width: 80 });
 assert.ok(text.getSize({ key: 'r0', index: 0, value: rows[0], viewport: { offset: 0, size: 10 } }) >= 20);
+const multilineText = createTextLayout({ field: 'body', font: '14px Inter', lineHeight: 10, width: 3, averageCharWidth: 1 });
+assert.strictEqual(
+  multilineText.getSize({
+    key: 'multiline',
+    index: 0,
+    value: { body: 'abc\ndefg\n' },
+    viewport: { offset: 0, size: 10 }
+  }),
+  40
+);
 
 const grid = virtualizeGrid({
   rowCount: 100,

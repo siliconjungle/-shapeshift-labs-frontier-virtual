@@ -3,10 +3,14 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import {
+  captureVirtualAnchor,
   createFixedLayout,
   createTextLayout,
+  createVariableLayout,
   virtualize,
-  virtualizeFrustum
+  virtualizeAnchored,
+  virtualizeFrustum,
+  virtualizeGrid
 } from '../dist/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -20,7 +24,9 @@ let sink = 0;
 
 const results = [
   measureVirtualizeFixedRows(rows),
+  measureVirtualizeFixedGrid(rows),
   measureVirtualizeTextRows(Math.min(rows, 3000)),
+  measurePreserveAnchorVariableRows(Math.min(rows, 3000)),
   measureFrustumCull(rows)
 ];
 
@@ -79,6 +85,52 @@ function measureVirtualizeTextRows(rowCount) {
     sink += range.totalSize;
   }
   return summarize('Virtualize text rows, ' + rowCount + ' rows', samples);
+}
+
+function measureVirtualizeFixedGrid(rowCount) {
+  const columnCount = Math.max(1, Math.floor(rowCount / 10));
+  const rowLayout = createFixedLayout(24);
+  const columnLayout = createFixedLayout(80);
+  const samples = [];
+  for (let round = 0; round < rounds; round++) {
+    const offset = (round * 137) % Math.max(1, rowCount * 24 - 600);
+    const crossOffset = (round * 89) % Math.max(1, columnCount * 80 - 800);
+    const start = performance.now();
+    const grid = virtualizeGrid({
+      rowCount,
+      columnCount,
+      rowLayout,
+      columnLayout,
+      viewport: { offset, size: 600, crossOffset, crossSize: 800 },
+      overscanRows: 2,
+      overscanColumns: 1
+    });
+    samples[samples.length] = (performance.now() - start) * 1000;
+    sink += grid.cells.length;
+  }
+  return summarize('Virtualize fixed grid, ' + rowCount + 'x' + columnCount + ' cells', samples);
+}
+
+function measurePreserveAnchorVariableRows(rowCount) {
+  const items = makeRows(rowCount);
+  const sizes = new Map();
+  for (let index = 0; index < rowCount; index++) sizes.set(items[index].id, 18 + (index % 13));
+  const layout = createVariableLayout({ defaultSize: 24, sizes });
+  const viewport = { offset: Math.floor(rowCount * 12), size: 600 };
+  const initial = virtualize({ items, keyBy: 'id', viewport, layout, overscan: 4 });
+  const anchor = captureVirtualAnchor(initial, { policy: 'start' });
+  if (!anchor) throw new Error('expected variable-row anchor');
+  const samples = [];
+  for (let round = 0; round < rounds; round++) {
+    const mutationLimit = Math.max(1, anchor.index);
+    const row = items[(round * 17) % mutationLimit];
+    layout.setSize(row.id, 18 + ((round * 7) % 31));
+    const start = performance.now();
+    const range = virtualizeAnchored({ items, keyBy: 'id', viewport: initial.viewport, layout, anchor, overscan: 4 });
+    samples[samples.length] = (performance.now() - start) * 1000;
+    sink += range.viewport.offset + range.items.length;
+  }
+  return summarize('Preserve variable anchor, ' + rowCount + ' rows', samples);
 }
 
 function measureFrustumCull(rowCount) {

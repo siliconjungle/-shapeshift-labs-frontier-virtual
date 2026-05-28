@@ -75,19 +75,30 @@ npm install @shapeshift-labs/frontier-virtual
 
 ```ts
 import {
-  createFixedLayout,
+  captureVirtualAnchor,
   createTextLayout,
   materializeWindowSource,
   virtualize,
+  virtualizeAnchored,
   virtualizeFrustum
 } from '@shapeshift-labs/frontier-virtual';
 
+const layout = createTextLayout({ field: 'body', font: '14px Inter', lineHeight: 20 });
 const range = virtualize({
   items: messages,
   keyBy: 'id',
   viewport: { offset: scrollTop, size: viewportHeight, crossSize: width },
-  layout: createTextLayout({ field: 'body', font: '14px Inter', lineHeight: 20 }),
+  layout,
   overscan: 8
+});
+
+const anchor = captureVirtualAnchor(range, { policy: 'start' });
+const preservedRange = virtualizeAnchored({
+  items: messages,
+  keyBy: 'id',
+  viewport: range.viewport,
+  layout,
+  anchor
 });
 
 const window = await materializeWindowSource(range, {
@@ -99,6 +110,8 @@ const visibleObjects = virtualizeFrustum(sceneAabbs, cameraFrustum);
 ```
 
 `frontier-virtual` does not import DOM, React, `frontier-dom`, storage adapters, or game engines. Renderers and adapters consume the range result and decide how to materialize it.
+
+`captureVirtualAnchor()`, `resolveVirtualAnchorOffset()`, and `virtualizeAnchored()` preserve a visible item across variable-size row changes, prepends, remote patch updates, and layout cache hydration. The anchor snapshot is JSON-serializable, so DOM renderers, canvas/WebGL views, and persisted virtual windows can resume scroll/camera-relative materialization without owning browser state.
 
 Scheduled helpers such as `scheduleVirtualize()`, `scheduleVirtualizeGrid()`, `scheduleVirtualizeSpatial()`, `scheduleVirtualizeFrustum()`, and `scheduleMaterializeWindowSource()` route the same work through any structural scheduler. This keeps camera culling, range math, and remote window materialization usable outside DOM renderers.
 
