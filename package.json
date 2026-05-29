@@ -51,7 +51,7 @@
     "frustum"
   ],
   "dependencies": {
-    "@shapeshift-labs/frontier": "0.1.8"
+    "@shapeshift-labs/frontier": "0.1.9"
   },
   "devDependencies": {
     "typescript": "^6.0.3"
